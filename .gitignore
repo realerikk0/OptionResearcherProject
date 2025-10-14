@@ -1,0 +1,33 @@
+# IDE and editor folders
+.idea/
+.vscode/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing and coverage outputs
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Data artifacts
+data/raw/*
+!data/raw/.gitignore
+
+# OS generated files
+.DS_Store
+Thumbs.db

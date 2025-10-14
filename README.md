@@ -11,8 +11,8 @@
 
 ## 数据包概览
 运行 `data/get_data.py` 后将在 `data/raw/` 目录生成：
-- `spy_option_chain.csv`：近 20 个交易日的期权链，包含日期、标的价格、行权价、到期日、报价、成交量、持仓量、隐含波动率等字段
-- `spy_underlying.csv`：SPY ETF 历史价格，字段涵盖开收盘价、最高最低价与成交量
+- `spy_option_chain.csv`：最新 3 个到期日、距 ATM 最近的合约（每种期权各保留 10 条），包含日期、标的价格、行权价、到期日、报价、成交量、持仓量、隐含波动率等字段
+- `spy_underlying.csv`：过去 1 年的 SPY ETF 日线行情，字段涵盖开收盘价、最高最低价与成交量
 - `treasury_rates.csv`：10 年期美国国债收益率序列，用作无风险利率
 
 ## 项目任务
@@ -98,15 +98,15 @@ matplotlib>=3.7.0
 seaborn>=0.12.0
 plotly>=5.17.0
 jupyter>=1.0.0
-# 可选
-quantlib-python>=1.31
-vectorbt>=0.25.0
+# 可选（按需单独安装）
+# quantlib-python
+# vectorbt
 ```
 
 ## 数据获取方法
 ### 方法一（推荐）：使用提供脚本
 - 进入 `data/`，运行 `python get_data.py`
-- 默认采集 2024 年内数据，过程约 3-5 分钟
+- 默认采集最近 1 年数据并抓取最新 3 个到期日、每种方向各 10 个近 ATM 合约，过程约 3-5 分钟
 - 自动生成 `data/raw/` 目录及三份 CSV 文件
 
 ### 方法二：自定义数据源
@@ -114,146 +114,16 @@ vectorbt>=0.25.0
 - 请保持字段命名与示例 schema 一致，确保下游脚本可复用
 
 ## 数据获取脚本
-```python
-"""
-美股期权数据获取脚本
-标的：SPY（S&P 500 ETF）
-"""
-
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
-
-print("=" * 70)
-print("美股期权数据获取脚本 - SPY")
-print("=" * 70)
-
-# ========== 配置参数 ==========
-SYMBOL = "SPY"
-START_DATE = "2024-01-01"
-END_DATE = "2024-12-31"
-
-# ========== 1. 获取SPY现货数据 ==========
-print("\n[1/3] 获取SPY ETF历史价格...")
-
-def get_underlying_data():
-    """获取SPY历史价格"""
-    spy = yf.Ticker(SYMBOL)
-    df = spy.history(start=START_DATE, end=END_DATE)
-    df = df.reset_index()
-    df.columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'dividends', 'stock_splits']
-    df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
-    print(f"✓ 获取到 {len(df)} 个交易日的数据")
-    print(f"  日期范围: {df['date'].min()} 到 {df['date'].max()}")
-    print(f"  价格范围: ${df['close'].min():.2f} - ${df['close'].max():.2f}")
-    return df
-
-spy_data = get_underlying_data()
-spy_data.to_csv('raw/spy_underlying.csv', index=False)
-print("  已保存到: raw/spy_underlying.csv")
-
-# ========== 2. 获取期权链数据 ==========
-print("\n[2/3] 获取SPY期权链数据...")
-
-def get_option_chain_data(dates_sample=20):
-    """获取SPY期权链数据"""
-    spy = yf.Ticker(SYMBOL)
-    expirations = spy.options
-    print(f"  找到 {len(expirations)} 个到期日")
-    selected_expirations = expirations[:3]
-    print(f"  将获取以下到期日的数据: {selected_expirations}")
-    all_options = []
-    for exp_date in selected_expirations:
-        try:
-            print(f"\n  处理到期日: {exp_date}")
-            opt_chain = spy.option_chain(exp_date)
-            calls = opt_chain.calls.copy(); calls['option_type'] = 'call'; calls['expiration'] = exp_date
-            puts = opt_chain.puts.copy(); puts['option_type'] = 'put'; puts['expiration'] = exp_date
-            options = pd.concat([calls, puts], ignore_index=True)
-            columns = ['contractSymbol', 'strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility', 'option_type', 'expiration']
-            options = options[columns]
-            options.columns = ['contract_symbol', 'strike', 'last', 'bid', 'ask', 'volume', 'open_interest', 'implied_volatility', 'option_type', 'expiration']
-            options['date'] = datetime.now().strftime('%Y-%m-%d')
-            options['underlying_price'] = spy_data['close'].iloc[-1]
-            options = options[options['bid'] > 0]
-            current_price = spy_data['close'].iloc[-1]
-            options['distance_from_atm'] = abs(options['strike'] - current_price)
-            calls_filtered = options[options['option_type'] == 'call'].nsmallest(10, 'distance_from_atm')
-            puts_filtered = options[options['option_type'] == 'put'].nsmallest(10, 'distance_from_atm')
-            options_filtered = pd.concat([calls_filtered, puts_filtered])
-            all_options.append(options_filtered)
-            print(f"    ✓ 获取 {len(options_filtered)} 个期权合约")
-        except Exception as e:
-            print(f"    ✗ 失败: {e}")
-    if all_options:
-        df = pd.concat(all_options, ignore_index=True)
-        df = df[['date', 'underlying_price', 'option_type', 'strike', 'expiration', 'bid', 'ask', 'last', 'volume', 'open_interest', 'implied_volatility', 'contract_symbol']]
-        print(f"\n✓ 总共获取 {len(df)} 条期权数据")
-        return df
-    return None
-
-option_data = get_option_chain_data()
-if option_data is not None:
-    option_data.to_csv('raw/spy_option_chain.csv', index=False)
-    print("  已保存到: raw/spy_option_chain.csv")
-
-# ========== 3. 获取无风险利率 ==========
-print("\n[3/3] 获取美国国债收益率（无风险利率）...")
-
-def get_treasury_rates():
-    """获取美国10年期国债收益率"""
-    try:
-        treasury = yf.Ticker("^TNX")
-        df = treasury.history(start=START_DATE, end=END_DATE)
-        df = df.reset_index()[['Date', 'Close']]
-        df.columns = ['date', 'rate_10y']
-        df['rate_10y'] = df['rate_10y'] / 100
-        print(f"✓ 获取到 {len(df)} 个交易日的利率数据")
-        print(f"  利率范围: {df['rate_10y'].min()*100:.2f}% - {df['rate_10y'].max()*100:.2f}%")
-        return df
-    except Exception as e:
-        print(f"  ✗ 无法获取实时利率: {e}")
-        print("  使用固定利率: 4.5%")
-        dates = pd.date_range(start=START_DATE, end=END_DATE, freq='D')
-        return pd.DataFrame({'date': dates, 'rate_10y': 0.045})
-
-treasury_data = get_treasury_rates()
-treasury_data.to_csv('raw/treasury_rates.csv', index=False)
-print("  已保存到: raw/treasury_rates.csv")
-
-# ========== 数据摘要 ==========
-print("\n" + "=" * 70)
-print("数据获取完成！")
-print("=" * 70)
-print("\n📊 数据摘要:")
-print(f"  • SPY价格数据: {len(spy_data)} 行")
-print(f"  • 期权链数据: {len(option_data) if option_data is not None else 0} 行")
-print(f"  • 国债利率数据: {len(treasury_data)} 行")
-print("\n📁 文件位置:")
-print("  • raw/spy_underlying.csv")
-print("  • raw/spy_option_chain.csv")
-print("  • raw/treasury_rates.csv")
-print("\n✅ 您现在可以开始分析了！")
-
-# ========== 数据质量检查 ==========
-print("\n" + "=" * 70)
-print("数据质量检查")
-print("=" * 70)
-if option_data is not None:
-    print("\n期权数据样例:")
-    print(option_data.head(3))
-    print("\n期权类型分布:")
-    print(option_data['option_type'].value_counts())
-    print("\n到期日分布:")
-    print(option_data['expiration'].value_counts())
-    print("\n隐含波动率统计:")
-    print(f"  平均IV: {option_data['implied_volatility'].mean():.2%}")
-    print(f"  IV范围: {option_data['implied_volatility'].min():.2%} - {option_data['implied_volatility'].max():.2%}")
-print("\n" + "=" * 70)
+完整实现位于 `data/get_data.py`，可直接运行以下命令获取数据：
+```bash
+cd data
+python get_data.py
 ```
+脚本主要步骤：
+- 下载最近 12 个月的 SPY 日线行情（若 1d 范围为空会退回 `period=\"1y\"`）并保存为 `data/raw/spy_underlying.csv`
+- 拉取最新期权链（默认取最近三个到期日、每种方向各保留 10 个最接近 ATM 的合约）并保存为 `data/raw/spy_option_chain.csv`
+- 获取 10 年期国债收益率（若实时拉取失败将回退为 4.5% 常数）并保存为 `data/raw/treasury_rates.csv`
+- 输出数据摘要与基础质量检查，便于快速确认样本数量、期权分布与隐含波动率区间
 
 ## 项目目录建议
 ```text
