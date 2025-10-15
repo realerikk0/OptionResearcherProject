@@ -1,0 +1,23 @@
+{
+  "calendar_vol_spread": {
+    "total_return": 0.0013315479306557076,
+    "annualized_return": 0.016907745767361648,
+    "sharpe_ratio": 49.646912961435426,
+    "max_drawdown": 0.0,
+    "win_rate": 1.0
+  },
+  "put_call_parity": {
+    "total_return": 0.0010320140909354514,
+    "annualized_return": 0.013081512628994929,
+    "sharpe_ratio": 72.04881301695698,
+    "max_drawdown": 0.0,
+    "win_rate": 1.0
+  },
+  "combined": {
+    "total_return": 0.002108889716565532,
+    "annualized_return": 0.02689953231689146,
+    "sharpe_ratio": 71.57854060473208,
+    "max_drawdown": 0.0,
+    "win_rate": 1.0
+  }
+}
