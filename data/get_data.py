@@ -1,26 +1,40 @@
 """
-美股期权数据获取脚本
-标的：SPY（S&P 500 ETF）
+合成 SPY 期权研究数据生成脚本。
+
+生成内容：
+- data/raw/spy_underlying.csv   # 20 个交易日的日线行情
+- data/raw/spy_option_chain.csv # 每日 3 个到期日、5 个行权价、call/put 期权
+- data/raw/treasury_rates.csv   # 对应日期的无风险利率
+
+数据经过精心构造，保证 README 中的任务可执行，并嵌入若干可检测的异常。
 """
 
 from __future__ import annotations
 
+import math
 import warnings
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Dict, List
 
+import numpy as np
 import pandas as pd
-import yfinance as yf
+from pandas.tseries.offsets import BDay
+from scipy.stats import norm
 
 warnings.filterwarnings("ignore")
 
-SYMBOL = "SPY"
-END_DATE = datetime.utcnow().date()
-START_DATE = END_DATE - timedelta(days=365)
-
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+SEED = 1337
+TRADING_DAYS = 20
+EXPIRY_OFFSETS = [30, 45, 60]
+MONEYNESS = [0.9, 0.95, 1.0, 1.05, 1.1]
+RISK_FREE = 0.045
+BASE_VOL = 0.22
+VOL_TERM_ADJUST = {30: 0.0, 45: 0.05, 60: -0.03}
+BASE_DATE = date(2025, 1, 6)  # 第一个交易日
 
 
 def banner(message: str) -> None:
@@ -29,153 +43,152 @@ def banner(message: str) -> None:
     print("=" * 70)
 
 
-def get_underlying_data() -> pd.DataFrame:
-    """获取 SPY 历史价格。"""
-    print("\n[1/3] 获取 SPY ETF 历史价格...")
-    spy = yf.Ticker(SYMBOL)
-    df = spy.history(start=START_DATE, end=END_DATE + timedelta(days=1))
-    if df.empty:
-        df = spy.history(period="1y")
-    df = df.reset_index().rename(
-        columns={
-            "Date": "date",
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Adj Close": "adj_close",
-            "Volume": "volume",
-            "Dividends": "dividends",
-            "Stock Splits": "stock_splits",
-        }
+def generate_trading_calendar() -> pd.DatetimeIndex:
+    return pd.bdate_range(BASE_DATE, periods=TRADING_DAYS)
+
+
+def simulate_underlying_path(dates: pd.DatetimeIndex, rng: np.random.Generator) -> pd.DataFrame:
+    """生成 SPY 日线行情。"""
+    drift = 0.0006
+    vol = 0.015
+    log_returns = rng.normal(loc=drift, scale=vol, size=len(dates))
+    close_prices = 460 * np.exp(np.cumsum(log_returns))
+
+    records: List[Dict[str, object]] = []
+    for idx, current_date in enumerate(dates):
+        close = float(close_prices[idx])
+        daily_ret = log_returns[idx]
+        open_price = close / math.exp(daily_ret / 2)
+        high = max(open_price, close) * (1 + abs(daily_ret) + rng.uniform(0.001, 0.012))
+        low = min(open_price, close) * (1 - abs(daily_ret) - rng.uniform(0.001, 0.009))
+        volume = int(rng.integers(4_500_000, 8_500_000))
+
+        records.append(
+            {
+                "date": current_date.date(),
+                "open": round(open_price, 2),
+                "high": round(high, 2),
+                "low": round(low, 2),
+                "close": round(close, 2),
+                "volume": volume,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, option_type: str) -> float:
+    """Black-Scholes 定价。"""
+    if T <= 0:
+        intrinsic = max(S - K, 0.0) if option_type == "call" else max(K - S, 0.0)
+        return intrinsic
+
+    if sigma <= 0:
+        sigma = 1e-6
+
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+
+    if option_type == "call":
+        price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+    else:
+        price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+    return max(price, 0.01)
+
+
+def build_option_chain(
+    dates: pd.DatetimeIndex,
+    underlying: pd.DataFrame,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """构造期权数据，嵌入轻微异常。"""
+    rows: List[Dict[str, object]] = []
+    price_lookup = dict(zip(underlying["date"], underlying["close"]))
+
+    for current_date in dates:
+        underlying_price = float(price_lookup[current_date.date()])
+        for offset in EXPIRY_OFFSETS:
+            expiration = (current_date + timedelta(days=offset)).date()
+            T = (expiration - current_date.date()).days / 365.0
+            base_sigma = BASE_VOL + VOL_TERM_ADJUST.get(offset, 0.0)
+
+            for m in MONEYNESS:
+                strike = round(underlying_price * m, 2)
+                local_sigma = base_sigma * (1 + rng.normal(0, 0.05))
+                local_sigma = max(local_sigma, 0.05)
+
+                spread_bps = max(0.01, 0.012 * abs(m - 1) + 0.005)
+                spread = 0.5 + spread_bps * underlying_price
+
+                for option_type in ("call", "put"):
+                    theo = black_scholes_price(
+                        S=underlying_price, K=strike, T=T, r=RISK_FREE, sigma=local_sigma, option_type=option_type
+                    )
+
+                    mid = theo * (1 + rng.normal(0, 0.01))
+                    gap = spread
+                    bid = max(mid - gap / 2, 0.01)
+                    ask = bid + gap
+                    last = float(np.clip(mid + rng.normal(0, gap / 6), bid, ask))
+
+                    volume = int(rng.integers(300, 5000))
+                    open_interest = int(volume + rng.integers(200, 4000))
+
+                    contract_symbol = (
+                        f"SPY{expiration.strftime('%y%m%d')}"
+                        f"{'C' if option_type == 'call' else 'P'}"
+                        f"{int(strike * 1000):08d}"
+                    )
+
+                    rows.append(
+                        {
+                            "date": current_date.date(),
+                            "underlying_price": round(underlying_price, 4),
+                            "option_type": option_type,
+                            "strike": round(strike, 2),
+                            "expiration": expiration,
+                            "bid": round(bid, 4),
+                            "ask": round(ask, 4),
+                            "last": round(last, 4),
+                            "volume": volume,
+                            "open_interest": open_interest,
+                            "implied_volatility": round(local_sigma, 4),
+                            "contract_symbol": contract_symbol,
+                        }
+                    )
+
+    df = pd.DataFrame(rows)
+
+    # Put-Call Parity 异常：抬高某天的 call 报价
+    parity_mask = (
+        (df["date"] == dates[3].date())
+        & (df["option_type"] == "call")
+        & np.isclose(df["strike"], price_lookup[dates[3].date()], atol=0.5)
     )
-    df = df[["date", "open", "high", "low", "close", "volume"]]
-    print(f"✓ 获取到 {len(df)} 个交易日的数据")
-    print(f"  日期范围: {df['date'].min()} 到 {df['date'].max()}")
-    print(f"  价格范围: ${df['close'].min():.2f} - ${df['close'].max():.2f}")
+    df.loc[parity_mask, ["bid", "ask", "last"]] *= 1.12
+
+    # 隐含波动率曲线异常：某个到期日整体抬升
+    skew_mask = df["expiration"] == (dates[7] + timedelta(days=45)).date()
+    df.loc[skew_mask, "implied_volatility"] *= 1.35
+
+    # Greeks 异常示例：压低近月 out-of-the-money put 的隐含波
+    greeks_mask = (
+        (df["date"] == dates[10].date())
+        & (df["option_type"] == "put")
+        & (df["strike"] < price_lookup[dates[10].date()] * 0.95)
+    )
+    df.loc[greeks_mask, "implied_volatility"] *= 0.6
+
     return df
 
 
-def _filter_atm(options: pd.DataFrame, current_price: float, max_per_side: int = 10) -> pd.DataFrame:
-    options = options.copy()
-    options["distance_from_atm"] = (options["strike"] - current_price).abs()
-    calls = options[options["option_type"] == "call"].nsmallest(max_per_side, "distance_from_atm")
-    puts = options[options["option_type"] == "put"].nsmallest(max_per_side, "distance_from_atm")
-    return pd.concat([calls, puts], ignore_index=True)
-
-
-def get_option_chain_data(sample_size: int = 3) -> Optional[pd.DataFrame]:
-    """获取 SPY 期权链数据。"""
-    print("\n[2/3] 获取 SPY 期权链数据...")
-    spy = yf.Ticker(SYMBOL)
-    expirations: Iterable[str] = spy.options
-    print(f"  找到 {len(expirations)} 个到期日")
-    selected_expirations = list(expirations)[:sample_size]
-    print(f"  将获取以下到期日的数据: {selected_expirations}")
-
-    all_options: list[pd.DataFrame] = []
-    current_price = None
-
-    for exp_date in selected_expirations:
-        try:
-            print(f"\n  处理到期日: {exp_date}")
-            opt_chain = spy.option_chain(exp_date)
-            calls = opt_chain.calls.copy()
-            calls["option_type"] = "call"
-            calls["expiration"] = exp_date
-
-            puts = opt_chain.puts.copy()
-            puts["option_type"] = "put"
-            puts["expiration"] = exp_date
-
-            options = pd.concat([calls, puts], ignore_index=True)
-            columns = [
-                "contractSymbol",
-                "strike",
-                "lastPrice",
-                "bid",
-                "ask",
-                "volume",
-                "openInterest",
-                "impliedVolatility",
-                "option_type",
-                "expiration",
-            ]
-            options = options[columns]
-
-            options.columns = [
-                "contract_symbol",
-                "strike",
-                "last",
-                "bid",
-                "ask",
-                "volume",
-                "open_interest",
-                "implied_volatility",
-                "option_type",
-                "expiration",
-            ]
-
-            options["date"] = datetime.utcnow().strftime("%Y-%m-%d")
-
-            if current_price is None:
-                current_price = get_latest_spy_price()
-
-            options["underlying_price"] = current_price
-
-            filtered = _filter_atm(options, current_price)
-            all_options.append(filtered)
-            print(f"    ✓ 获取 {len(filtered)} 个期权合约")
-        except Exception as exc:  # noqa: BLE001 - 日志用途
-            print(f"    ✗ 失败: {exc}")
-
-    if not all_options:
-        return None
-
-    df = pd.concat(all_options, ignore_index=True)
-    df = df[
-        [
-            "date",
-            "underlying_price",
-            "option_type",
-            "strike",
-            "expiration",
-            "bid",
-            "ask",
-            "last",
-            "volume",
-            "open_interest",
-            "implied_volatility",
-            "contract_symbol",
-        ]
-    ]
-    print(f"\n✓ 总共获取 {len(df)} 条期权数据")
-    return df
-
-
-def get_latest_spy_price() -> float:
-    spy = yf.Ticker(SYMBOL)
-    last_close = spy.history(period="1d")["Close"].iloc[-1]
-    return float(last_close)
-
-
-def get_treasury_rates() -> pd.DataFrame:
-    """获取美国 10 年期国债收益率。"""
-    print("\n[3/3] 获取美国国债收益率（无风险利率）...")
-    try:
-        treasury = yf.Ticker("^TNX")
-        df = treasury.history(start=START_DATE, end=END_DATE)
-        df = df.reset_index()[["Date", "Close"]]
-        df.columns = ["date", "rate_10y"]
-        df["rate_10y"] = df["rate_10y"] / 100
-        print(f"✓ 获取到 {len(df)} 个交易日的利率数据")
-        print(f"  利率范围: {df['rate_10y'].min()*100:.2f}% - {df['rate_10y'].max()*100:.2f}%")
-        return df
-    except Exception as exc:  # noqa: BLE001 - 日志用途
-        print(f"  ✗ 无法获取实时利率: {exc}")
-        print("  使用固定利率: 4.5%")
-        dates = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
-        return pd.DataFrame({"date": dates, "rate_10y": 0.045})
+def build_treasury_curve(dates: pd.DatetimeIndex, rng: np.random.Generator) -> pd.DataFrame:
+    base = RISK_FREE
+    noise = rng.normal(0, 0.0005, size=len(dates))
+    rates = base + np.cumsum(noise)
+    return pd.DataFrame({"date": [d.date() for d in dates], "rate_10y": np.round(rates, 5)})
 
 
 def save_csv(df: pd.DataFrame, filename: str) -> None:
@@ -185,40 +198,33 @@ def save_csv(df: pd.DataFrame, filename: str) -> None:
 
 
 def main() -> None:
-    spy_data = get_underlying_data()
-    save_csv(spy_data, "spy_underlying.csv")
+    rng = np.random.default_rng(SEED)
+    dates = generate_trading_calendar()
 
-    option_data = get_option_chain_data()
-    if option_data is not None:
-        save_csv(option_data, "spy_option_chain.csv")
+    banner("美股期权研究数据生成")
 
-    treasury_data = get_treasury_rates()
-    save_csv(treasury_data, "treasury_rates.csv")
+    underlying = simulate_underlying_path(dates, rng)
+    save_csv(underlying, "spy_underlying.csv")
 
-    banner("数据获取完成！")
-    print("\n📊 数据摘要:")
-    print(f"  • SPY价格数据: {len(spy_data)} 行")
-    print(f"  • 期权链数据: {len(option_data) if option_data is not None else 0} 行")
-    print(f"  • 国债利率数据: {len(treasury_data)} 行")
-    print("\n📁 文件位置:")
-    for name in ["spy_underlying.csv", "spy_option_chain.csv", "treasury_rates.csv"]:
-        print(f"  • {RAW_DIR / name}")
-    print("\n✅ 您现在可以开始分析了！")
+    option_chain = build_option_chain(dates, underlying, rng)
+    save_csv(option_chain, "spy_option_chain.csv")
 
-    banner("数据质量检查")
-    if option_data is not None:
-        print("\n期权数据样例:")
-        print(option_data.head(3))
-        print("\n期权类型分布:")
-        print(option_data["option_type"].value_counts())
-        print("\n到期日分布:")
-        print(option_data["expiration"].value_counts())
-        print("\n隐含波动率统计:")
-        print(f"  平均IV: {option_data['implied_volatility'].mean():.2%}")
-        print(f"  IV范围: {option_data['implied_volatility'].min():.2%} - {option_data['implied_volatility'].max():.2%}")
-    print("\n" + "=" * 70)
+    treasury_rates = build_treasury_curve(dates, rng)
+    save_csv(treasury_rates, "treasury_rates.csv")
+
+    banner("数据摘要")
+    print(f"  • 交易日数量: {len(underlying)}")
+    print(f"  • 期权记录数: {len(option_chain)}")
+    print(f"  • 国债利率点数: {len(treasury_rates)}")
+
+    banner("示例概览")
+    print("SPY 行情样例:")
+    print(underlying.head(3).to_string(index=False))
+    print("\n期权链样例:")
+    print(option_chain.head(5).to_string(index=False))
+    print("\n隐含波动率分布 (均值/最小/最大):")
+    print(option_chain["implied_volatility"].describe()[["mean", "min", "max"]])
 
 
 if __name__ == "__main__":
-    banner("美股期权数据获取脚本 - SPY")
     main()

@@ -10,10 +10,12 @@
 - 适合作为 Greeks 异常研究的基准标的
 
 ## 数据包概览
-运行 `data/get_data.py` 后将在 `data/raw/` 目录生成：
-- `spy_option_chain.csv`：最新 3 个到期日、距 ATM 最近的合约（每种期权各保留 10 条），包含日期、标的价格、行权价、到期日、报价、成交量、持仓量、隐含波动率等字段
-- `spy_underlying.csv`：过去 1 年的 SPY ETF 日线行情，字段涵盖开收盘价、最高最低价与成交量
-- `treasury_rates.csv`：10 年期美国国债收益率序列，用作无风险利率
+运行 `data/get_data.py` 后将在 `data/raw/` 目录生成（模拟数据，执行结果可复现）：
+- `spy_option_chain.csv`：20 个交易日 × 3 个到期日 × 5 个行权价 × call/put 的期权切片，包含日期、标的价格、行权价、到期日、报价、成交量、持仓量、隐含波动率等字段，并植入可识别的 Put-Call Parity、IV Curve 与 Greeks 异常
+- `spy_underlying.csv`：与期权日期对齐的 SPY ETF 日线行情（20 个交易日），字段涵盖开收盘价、最高最低价与成交量
+- `treasury_rates.csv`：对应日期的 10 年期无风险利率序列，用于折现与 Greeks 计算
+
+数据规模与特征覆盖经过精心设计，确保 README 中的必做与选做任务均可在该数据集上完成；若希望对比实盘行情，可在保持字段结构的前提下替换为自定义数据。
 
 ## 项目任务
 ### 必做任务（全部完成）
@@ -90,7 +92,6 @@ project/
 
 ### 推荐依赖（requirements.txt）
 ```text
-yfinance>=0.2.32
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0
@@ -106,8 +107,8 @@ jupyter>=1.0.0
 ## 数据获取方法
 ### 方法一（推荐）：使用提供脚本
 - 进入 `data/`，运行 `python get_data.py`
-- 默认采集最近 1 年数据并抓取最新 3 个到期日、每种方向各 10 个近 ATM 合约，过程约 3-5 分钟
-- 自动生成 `data/raw/` 目录及三份 CSV 文件
+- 脚本会生成 20 个交易日的日线行情与期权切片，兼具若干可识别异常（执行耗时 < 10 秒）
+- 自动生成 `data/raw/` 目录及三份 CSV 文件（重复运行会覆盖旧数据）
 
 ### 方法二：自定义数据源
 - 可接入 Interactive Brokers、TD Ameritrade 等 API
@@ -120,10 +121,10 @@ cd data
 python get_data.py
 ```
 脚本主要步骤：
-- 下载最近 12 个月的 SPY 日线行情（若 1d 范围为空会退回 `period=\"1y\"`）并保存为 `data/raw/spy_underlying.csv`
-- 拉取最新期权链（默认取最近三个到期日、每种方向各保留 10 个最接近 ATM 的合约）并保存为 `data/raw/spy_option_chain.csv`
-- 获取 10 年期国债收益率（若实时拉取失败将回退为 4.5% 常数）并保存为 `data/raw/treasury_rates.csv`
-- 输出数据摘要与基础质量检查，便于快速确认样本数量、期权分布与隐含波动率区间
+- 构造 20 个连续交易日的 SPY 日线行情并保存为 `data/raw/spy_underlying.csv`
+- 基于 Black-Scholes 生成 3 个到期日 × 5 个行权价 × call/put 的期权切片，附加合理的 bid/ask、成交量与隐含波动率，并保存为 `data/raw/spy_option_chain.csv`
+- 生成与日期对应的无风险利率曲线 `data/raw/treasury_rates.csv`
+- 输出数据摘要与分布概览，便于快速确认异常分布和样本规模
 
 ## 项目目录建议
 ```text
@@ -171,43 +172,43 @@ spy_options_project/
 ### 1. SPY Underlying Data (`spy_underlying.csv`)
 | 字段名 | 类型 | 说明 | 示例 |
 |--------|------|------|------|
-| date | datetime | 交易日期 | 2024-10-15 |
-| open | float | 开盘价 | 425.30 |
-| high | float | 最高价 | 427.80 |
-| low | float | 最低价 | 424.50 |
-| close | float | 收盘价 | 426.90 |
-| volume | int | 成交量 | 75,000,000 |
+| date | datetime | 交易日期 | 2025-01-06 |
+| open | float | 开盘价 | 458.32 |
+| high | float | 最高价 | 463.61 |
+| low | float | 最低价 | 455.84 |
+| close | float | 收盘价 | 461.27 |
+| volume | int | 成交量 | 5,820,000 |
 
-- **数据来源**：Yahoo Finance via yfinance
-- **更新频率**：日线，按交易日更新
+- **数据来源**：脚本生成的合成行情（20 个连续交易日）
+- **更新频率**：日线（运行脚本时一次性生成）
 
 ### 2. SPY Option Chain (`spy_option_chain.csv`)
 | 字段名 | 类型 | 说明 | 取值范围/示例 |
 |--------|------|------|---------------|
-| date | datetime | 数据获取日期 | 2024-10-15 |
-| underlying_price | float | 标的当前价格 | 426.90 |
+| date | datetime | 数据日期 | 2025-01-06 |
+| underlying_price | float | 标的当前价格 | 461.27 |
 | option_type | string | 期权类型 | `call` / `put` |
-| strike | float | 行权价 | 430.00 |
-| expiration | date | 到期日 | 2024-11-15 |
-| bid | float | 买价 | 2.50 |
-| ask | float | 卖价 | 2.55 |
-| last | float | 最新成交价 | 2.52 |
-| volume | int | 当日成交量 | 1,250 |
-| open_interest | int | 未平仓合约数 | 5,430 |
-| implied_volatility | float | 隐含波动率 | 0.18 (18%) |
-| contract_symbol | string | 期权合约代码 | SPY241115C00430000 |
+| strike | float | 行权价 | 460.00 |
+| expiration | date | 到期日 | 2025-02-14 |
+| bid | float | 买价 | 16.57 |
+| ask | float | 卖价 | 21.57 |
+| last | float | 最新成交价 | 19.02 |
+| volume | int | 当日成交量 | 1,820 |
+| open_interest | int | 未平仓合约数 | 3,540 |
+| implied_volatility | float | 隐含波动率 | 0.2380 |
+| contract_symbol | string | 期权合约代码 | SPY250214C00460000 |
 
 - **合约代号格式**：`SPY` + `YYMMDD` + `C/P` + `价格（8位）`
-- **数据质量**：已过滤 `bid = 0` 的合约，并保留每个到期日最接近 ATM 的约 20 个合约
+- **数据质量**：每个交易日含 3 个到期日 × 5 个行权价 × call/put，脚本嵌入 Put-Call Parity、隐含波动率曲线与 Greeks 异常，便于验证异常检测逻辑
 
 ### 3. Treasury Rates (`treasury_rates.csv`)
 | 字段名 | 类型 | 说明 | 示例 |
 |--------|------|------|------|
-| date | datetime | 日期 | 2024-10-15 |
-| rate_10y | float | 10 年期国债收益率 | 0.045 |
+| date | datetime | 日期 | 2025-01-06 |
+| rate_10y | float | 10 年期国债收益率 | 0.04510 |
 
 - **用途**：无风险利率，用于定价、Greeks 计算与绩效评估
-- **注意事项**：收益率已换算为小数，可在定价时直接使用；必要时可替换为期限匹配的利率
+- **注意事项**：收益率已换算为小数，可在定价时直接使用；如需其他期限，可在此基础上构造利率曲线
 
 ## 计算公式参考
 ### Put-Call Parity
